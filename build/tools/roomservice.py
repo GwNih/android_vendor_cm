@@ -70,20 +70,41 @@ except:
 def add_auth(githubreq):
     if githubauth:
         githubreq.add_header("Authorization","Basic %s" % githubauth)
-
-if not depsonly:
+        
+def get_lineage_repo():
     githubreq = urllib.request.Request("https://api.github.com/search/repositories?q=%s+user:LineageOS+in:name+fork:true" % device)
     add_auth(githubreq)
     try:
-        result = json.loads(urllib.request.urlopen(githubreq).read().decode())
+        result_repo = json.loads(urllib.request.urlopen(githubreq).read().decode())
     except urllib.error.URLError:
-        print("Failed to search GitHub")
+        print("Failed to search Lineage GitHub")
         sys.exit()
     except ValueError:
         print("Failed to parse return data from GitHub")
         sys.exit()
-    for res in result.get('items', []):
-        repositories.append(res)
+    lineage_repositories = []
+    for res in result_repo.get('items', []):
+        lineage_repositories.append(res)
+    return lineage_repositories
+
+def get_ridon_repo():
+    githubreq = urllib.request.Request("https://api.github.com/search/repositories?q=%s+user:ridon+in:name+fork:true" % device)
+    add_auth(githubreq)
+    ridon_repositories = []
+    try:
+        result_repo = json.loads(urllib.request.urlopen(githubreq).read().decode())
+    except urllib.error.URLError:
+        print("Failed to search Ridon GitHub")
+        return ridon_repositories
+    except ValueError:
+        print("Failed to parse return data from GitHub")
+        return ridon_repositories
+    if not result_repo:
+        print("Not such device")
+        return ridon_repositories
+    for res in result_repo.get('items', []):
+        ridon_repositories.append(res)
+    return ridon_repositories
 
 local_manifests = r'.repo/local_manifests'
 if not os.path.exists(local_manifests): os.makedirs(local_manifests)
@@ -114,6 +135,15 @@ def get_default_revision():
     m = ElementTree.parse(".repo/manifest.xml")
     d = m.findall('default')[0]
     r = d.get('revision')
+    return r.replace('refs/heads/', '').replace('refs/tags/', '')
+
+def get_default_ridon_revision():
+    m = ElementTree.parse(".repo/manifest.xml")
+    d = m.findall('default')[0]
+    r = d.get('ridon-revision')
+    print("branch: " + r)
+    if not r:
+        return get_default_revision()
     return r.replace('refs/heads/', '').replace('refs/tags/', '')
 
 def get_from_manifest(devicename):
@@ -179,9 +209,22 @@ def add_to_manifest(repositories, fallback_branch = None):
             print('LineageOS/%s already fetched to %s' % (repo_name, repo_target))
             continue
 
-        print('Adding dependency: LineageOS/%s -> %s' % (repo_name, repo_target))
-        project = ElementTree.Element("project", attrib = { "path": repo_target,
-            "remote": "github", "name": "LineageOS/%s" % repo_name })
+        if 'remote' in repository:
+            print('Adding dependency: %s/%s -> %s' % (repository['remote'], repo_name, repo_target))
+        else:
+            print('Adding dependency: LineageOS/%s -> %s' % (repo_name, repo_target))
+            
+        project = ElementTree.Element("project", attrib = { "path": repo_target})
+
+        if 'remote' in repository:
+            project.set('remote',repository['remote'])
+        else:
+            project.set('remote','github')
+
+        if 'pre_path_remote' in repository:
+            project.set('name','%s/%s' % (repository['pre_path_remote'],repo_name))
+        else:
+            project.set('name','LineageOS/%s' % repo_name)
 
         if 'branch' in repository:
             project.set('revision',repository['branch'])
@@ -190,7 +233,7 @@ def add_to_manifest(repositories, fallback_branch = None):
             project.set('revision', fallback_branch)
         else:
             print("Using default branch for %s" % repo_name)
-
+            
         lm.append(project)
 
     indent(lm, 0)
@@ -203,7 +246,7 @@ def add_to_manifest(repositories, fallback_branch = None):
 
 def fetch_dependencies(repo_path, fallback_branch = None):
     print('Looking for dependencies in %s' % repo_path)
-    dependencies_paths = [repo_path + '/lineage.dependencies', repo_path + '/cm.dependencies']
+    dependencies_paths = [repo_path + '/ridon.dependencies', repo_path + '/lineage.dependencies', repo_path + '/cm.dependencies']
     found_dependencies = False
     syncable_repos = []
     verify_repos = []
@@ -242,7 +285,7 @@ def fetch_dependencies(repo_path, fallback_branch = None):
 
 def has_branch(branches, revision):
     return revision in [branch['name'] for branch in branches]
-
+   
 if depsonly:
     repo_path = get_from_manifest(device)
     if repo_path:
@@ -253,6 +296,65 @@ if depsonly:
     sys.exit()
 
 else:
+    print("Trying to get Device Tree on Ridon Github")
+    repositories =get_ridon_repo();
+    for repository in repositories:
+        repo_name = repository['name']
+        if re.match(r"^android_device_[^_]*_" + device + "$", repo_name):
+            print("Found repository: %s" % repository['name'])
+            
+            manufacturer = repo_name.replace("android_device_", "").replace("_" + device, "")
+            
+            default_ridon_revision = get_default_ridon_revision()
+            default_revision = get_default_revision()
+            print("Default Ridon revision: %s" % default_ridon_revision)
+            print("Default revision: %s" % default_revision)
+            print("Checking branch info")
+            githubreq = urllib.request.Request(repository['branches_url'].replace('{/branch}', ''))
+            add_auth(githubreq)
+            result = json.loads(urllib.request.urlopen(githubreq).read().decode())
+
+            ## Try tags, too, since that's what releases use
+            if not (has_branch(result, default_revision) or has_branch(result, default_ridon_revision)):
+                githubreq = urllib.request.Request(repository['tags_url'].replace('{/tag}', ''))
+                add_auth(githubreq)
+                result.extend (json.loads(urllib.request.urlopen(githubreq).read().decode()))
+            
+            repo_path = "device/%s/%s" % (manufacturer, device)
+            adding = {'repository':repo_name,'target_path':repo_path,'remote':'ridon-remote','pre_path_remote':'ridon'}
+            if has_branch(result, default_ridon_revision):
+                adding['branch'] = default_ridon_revision
+            
+            fallback_branch = None
+            if not has_branch(result, default_revision):
+                if os.getenv('ROOMSERVICE_BRANCHES'):
+                    fallbacks = list(filter(bool, os.getenv('ROOMSERVICE_BRANCHES').split(' ')))
+                    for fallback in fallbacks:
+                        if has_branch(result, fallback):
+                            print("Using fallback branch: %s" % fallback)
+                            fallback_branch = fallback
+                            break
+
+                if not fallback_branch:
+                    print("Default revision %s not found in %s. Bailing." % (default_revision, repo_name))
+                    print("Branches found:")
+                    for branch in [branch['name'] for branch in result]:
+                        print(branch)
+                    print("Use the ROOMSERVICE_BRANCHES environment variable to specify a list of fallback branches.")
+                    sys.exit()
+
+            add_to_manifest([adding], fallback_branch)
+
+            print("Syncing repository to retrieve project.")
+            os.system('repo sync --force-sync %s' % repo_path)
+            print("Repository synced!")
+
+            fetch_dependencies(repo_path, fallback_branch)
+            print("Done")
+            sys.exit()
+            
+    # Cek Repository tree on Original LineageOS for backup if GwOS has not forking yet
+    repositories = get_lineage_repo()
     for repository in repositories:
         repo_name = repository['name']
         if re.match(r"^android_device_[^_]*_" + device + "$", repo_name):
@@ -301,6 +403,21 @@ else:
             print("Repository synced!")
 
             fetch_dependencies(repo_path, fallback_branch)
+            
+            #Ganti Nama Produk ke ridon_%device%
+            mk_file='/lineage.mk'
+            if not os.path.isfile(repo_path+'/lineage.mk'):
+                mk_file='/cm.mk'
+            # Read in the file
+            with open(repo_path+mk_file, 'r') as file :
+                filedata = file.read()
+                file.close()
+            # Replace the target string
+            filedata = filedata.replace('lineage_'+device, 'ridon_'+device)
+            # Write the file out again
+            with open(repo_path+mk_file, 'w') as file:
+                file.write(filedata)
+                file.close()
             print("Done")
             sys.exit()
 
